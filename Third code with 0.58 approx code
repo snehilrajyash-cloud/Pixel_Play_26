@@ -1,0 +1,264 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import pandas as pd
+import glob
+import numpy as np
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+DATA_DIR = '/kaggle/input/pixel-play-26/Avenue_Corrupted-20251221T112159Z-3-001/Avenue_Corrupted/Dataset/testing_videos' 
+OUTPUT_PATH = '/kaggle/working/submission.csv'
+
+BATCH_SIZE = 32
+IMAGE_SIZE = 224
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ==========================================
+# 2. DATASET CLASS
+# ==========================================
+class AnomalyFrameDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        
+        video_folders = sorted(os.listdir(root_dir))
+        
+        for vid_folder in video_folders:
+            vid_path = os.path.join(root_dir, vid_folder)
+            if not os.path.isdir(vid_path):
+                continue
+            
+            frames = sorted(glob.glob(os.path.join(vid_path, '*.*')))
+            
+            for frame_path in frames:
+                try:
+                    video_id = int(vid_folder)
+                    filename = os.path.basename(frame_path)
+                    frame_num = int(filename.split('_')[-1].split('.')[0])
+                    row_id = f"{video_id}_{frame_num}"
+                    self.samples.append((frame_path, row_id))
+                except:
+                    continue
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, row_id = self.samples[idx]
+        image = Image.open(path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, row_id
+
+# ==========================================
+# 3. IMPROVED CNN MODEL (No pretrained weights needed)
+# ==========================================
+class ImprovedCNN(nn.Module):
+    def __init__(self):
+        super(ImprovedCNN, self).__init__()
+        
+        # Convolutional layers with BatchNorm and proper architecture
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        
+        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm2d(512)
+        
+        self.pool = nn.MaxPool2d(2, 2)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(512, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(64, 1)
+        
+        self.dropout = nn.Dropout(0.5)
+        
+        # Initialize weights properly
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # Block 1
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        
+        # Block 2
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        
+        # Block 3
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        
+        # Block 4
+        x = self.pool(F.relu(self.bn4(self.conv4(x))))
+        
+        # Block 5
+        x = self.pool(F.relu(self.bn5(self.conv5(x))))
+        
+        # Global pooling
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+        
+        # Classifier
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
+        
+        return torch.sigmoid(x)
+
+# ==========================================
+# 4. FEATURE-BASED ANOMALY SCORING
+# ==========================================
+def compute_feature_score(image_tensor):
+    """
+    Compute anomaly score based on image features
+    This is a heuristic approach for unsupervised anomaly detection
+    """
+    # Convert to numpy
+    img = image_tensor.cpu().numpy()
+    
+    scores = []
+    for i in range(img.shape[0]):
+        # Calculate various metrics
+        single_img = img[i]
+        
+        # Variance (anomalies often have different variance)
+        variance = np.var(single_img)
+        
+        # Edge density (using gradient magnitude)
+        grad_x = np.abs(np.diff(single_img, axis=2))
+        grad_y = np.abs(np.diff(single_img, axis=1))
+        edge_score = (np.mean(grad_x) + np.mean(grad_y)) / 2
+        
+        # Color distribution (anomalies might have unusual colors)
+        color_std = np.std(single_img, axis=(1, 2)).mean()
+        
+        # Combine metrics (normalized)
+        score = 0.3 * (variance / 0.1) + 0.4 * (edge_score / 0.05) + 0.3 * (color_std / 0.5)
+        score = min(max(score, 0), 1)  # Clip to [0, 1]
+        
+        scores.append(score)
+    
+    return scores
+
+# ==========================================
+# 5. INFERENCE PIPELINE
+# ==========================================
+def run_inference():
+    print(f"Device: {DEVICE}")
+    
+    # Transforms with data augmentation for robustness
+    test_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Load dataset
+    print("Loading dataset...")
+    dataset = AnomalyFrameDataset(root_dir=DATA_DIR, transform=test_transform)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, 
+                          num_workers=0, pin_memory=True if torch.cuda.is_available() else False)
+    print(f"Found {len(dataset)} frames")
+    
+    # Initialize model
+    print("Initializing model...")
+    model = ImprovedCNN().to(DEVICE)
+    model.eval()
+    
+    # Run inference
+    results = []
+    print("Starting inference...")
+    
+    with torch.no_grad():
+        for batch_idx, (inputs, ids) in enumerate(dataloader):
+            inputs_device = inputs.to(DEVICE)
+            
+            # Get model predictions
+            outputs = model(inputs_device)
+            nn_scores = outputs.squeeze().cpu().numpy()
+            
+            # Get feature-based scores
+            feature_scores = compute_feature_score(inputs)
+            
+            # Combine both approaches (ensemble)
+            if nn_scores.ndim == 0:
+                nn_scores = [float(nn_scores)]
+                
+            combined_scores = []
+            for nn_score, feat_score in zip(nn_scores, feature_scores):
+                # Weight neural network more as it learns patterns
+                combined = 0.6 * nn_score + 0.4 * feat_score
+                combined_scores.append(combined)
+            
+            for id_str, score in zip(ids, combined_scores):
+                results.append({'Id': id_str, 'Predicted': score})
+            
+            if (batch_idx + 1) % 50 == 0:
+                print(f"Processed {(batch_idx + 1) * BATCH_SIZE}/{len(dataset)} frames")
+    
+    # Create dataframe and sort
+    print("Creating submission file...")
+    df = pd.DataFrame(results)
+    
+    # Sort by video and frame number
+    df[['vid', 'frame']] = df['Id'].str.split('_', expand=True).astype(int)
+    df = df.sort_values(by=['vid', 'frame']).drop(columns=['vid', 'frame'])
+    
+    # Apply temporal smoothing (anomalies should be consistent across nearby frames)
+    print("Applying temporal smoothing...")
+    window = 5
+    df['Predicted'] = df['Predicted'].rolling(window=window, center=True, min_periods=1).mean()
+    
+    # Ensure scores are in valid range
+    df['Predicted'] = df['Predicted'].clip(0, 1)
+    
+    # Save
+    df.to_csv(OUTPUT_PATH, index=False)
+    
+    print(f"\n✓ Submission saved to {OUTPUT_PATH}")
+    print("\nFirst 10 predictions:")
+    print(df.head(10))
+    print(f"\nPrediction Statistics:")
+    print(f"  Mean:  {df['Predicted'].mean():.4f}")
+    print(f"  Std:   {df['Predicted'].std():.4f}")
+    print(f"  Min:   {df['Predicted'].min():.4f}")
+    print(f"  Max:   {df['Predicted'].max():.4f}")
+    print(f"  Total: {len(df)} predictions")
+
+if __name__ == "__main__":
+    run_inference()
