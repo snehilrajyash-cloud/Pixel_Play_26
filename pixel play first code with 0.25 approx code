@@ -1,0 +1,177 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import pandas as pd
+import glob
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+# REPLACE THIS with your actual Kaggle input path
+DATA_DIR = '/kaggle/input/pixel-play-26/Avenue_Corrupted-20251221T112159Z-3-001/Avenue_Corrupted/Dataset/testing_videos' 
+OUTPUT_PATH = '/kaggle/working/submission.csv'
+
+BATCH_SIZE = 32
+IMAGE_SIZE = 224
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ==========================================
+# 2. DATASET CLASS
+# ==========================================
+class SingleFrame3DDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        
+        # Walk through the directory to find all frames
+        # Assuming structure: root/01/frame_00001.jpg
+        video_folders = sorted(os.listdir(root_dir))
+        
+        for vid_folder in video_folders:
+            vid_path = os.path.join(root_dir, vid_folder)
+            if not os.path.isdir(vid_path):
+                continue
+            
+            # Get all image files in the video folder
+            frames = sorted(glob.glob(os.path.join(vid_path, '*.*')))
+            
+            for frame_path in frames:
+                # parsing ID
+                # Folder: "01" -> 1
+                # File: "frame_00001.jpg" -> 1
+                try:
+                    video_id = int(vid_folder)
+                    filename = os.path.basename(frame_path)
+                    # Split 'frame_00001.jpg' -> '00001' -> 1
+                    frame_num = int(filename.split('_')[-1].split('.')[0])
+                    
+                    row_id = f"{video_id}_{frame_num}"
+                    self.samples.append((frame_path, row_id))
+                except ValueError:
+                    continue # Skip files that don't match pattern
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, row_id = self.samples[idx]
+        
+        # Load Image
+        image = Image.open(path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Reshape for 3D CNN: (C, H, W) -> (C, Depth=1, H, W)
+        image = image.unsqueeze(1) 
+        
+        return image, row_id
+
+# ==========================================
+# 3. 3D CNN MODEL DEFINITION
+# ==========================================
+class Simple3DCNN(nn.Module):
+    def __init__(self):
+        super(Simple3DCNN, self).__init__()
+        
+        # Input: (Batch, 3, 1, 224, 224)
+        self.conv1 = nn.Conv3d(3, 16, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        self.bn1 = nn.BatchNorm3d(16)
+        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        
+        self.conv2 = nn.Conv3d(16, 32, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        self.bn2 = nn.BatchNorm3d(32)
+        
+        self.conv3 = nn.Conv3d(32, 64, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        self.bn3 = nn.BatchNorm3d(64)
+        
+        # Adaptive pool to handle variable sizes if needed, output 1x1 spatial
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        
+        self.fc1 = nn.Linear(64, 128)
+        self.fc2 = nn.Linear(128, 1) # Single output for score
+        
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        # x shape: (B, 3, 1, H, W)
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1) # Flatten
+        
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        # Output between 0 and 1
+        return torch.sigmoid(x) 
+
+# ==========================================
+# 4. INFERENCE PIPELINE
+# ==========================================
+def run_inference():
+    print(f"Setting up processing on {DEVICE}...")
+    
+    # 1. Transforms
+    test_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # 2. Load Data
+    dataset = SingleFrame3DDataset(root_dir=DATA_DIR, transform=test_transform)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    print(f"Found {len(dataset)} frames.")
+    
+    # 3. Initialize Model
+    model = Simple3DCNN().to(DEVICE)
+    
+    # NOTE: If you have trained weights, load them here:
+    # model.load_state_dict(torch.load('/path/to/weights.pth'))
+    
+    model.eval()
+    
+    results = []
+    
+    print("Starting prediction...")
+    with torch.no_grad():
+        for inputs, ids in dataloader:
+            inputs = inputs.to(DEVICE)
+            
+            # Forward pass
+            outputs = model(inputs)
+            
+            # Move to CPU and convert to list
+            scores = outputs.squeeze().cpu().tolist()
+            
+            # Handle case where batch size is 1 (tolist returns float instead of list)
+            if isinstance(scores, float):
+                scores = [scores]
+                
+            # Zip IDs and Scores
+            for id_str, score in zip(ids, scores):
+                results.append({'Id': id_str, 'Predicted': score})
+    
+    # 4. Save to CSV
+    df = pd.DataFrame(results)
+    
+    # Optional: Sort purely by logical order if needed, currently sorted by folder read order
+    # If strict sorting is required based on ID 1_1, 1_2 etc:
+    df[['vid', 'frame']] = df['Id'].str.split('_', expand=True).astype(int)
+    df = df.sort_values(by=['vid', 'frame']).drop(columns=['vid', 'frame'])
+    
+    df.to_csv(OUTPUT_PATH, index=False)
+    print(f"Submission saved to {OUTPUT_PATH}")
+    print(df.head())
+
+if __name__ == "__main__":
+    run_inference()
