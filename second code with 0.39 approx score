@@ -1,0 +1,182 @@
+import os
+import glob
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# ==========================================
+# 1. FIND THE DATA (Automatic Path Detection)
+# ==========================================
+# This block searches for your 'training_videos' folder automatically
+search_path = "/kaggle/input/**/training_videos"
+found_paths = glob.glob(search_path, recursive=True)
+
+if not found_paths:
+    print("CRITICAL ERROR: Could not find 'training_videos'!")
+    print("Please check the right sidebar and copy the path manually.")
+    # Fallback (You might need to edit this line if the auto-finder fails)
+    ROOT_DIR = "/kaggle/input/pixel-play-26/Avenue_Corrupted/Dataset" 
+else:
+    # We want the parent folder that contains both 'training_videos' and 'testing_videos'
+    ROOT_DIR = os.path.dirname(found_paths[0])
+    print(f"SUCCESS: Data found at: {ROOT_DIR}")
+
+TRAIN_PATH = os.path.join(ROOT_DIR, "training_videos")
+TEST_PATH = os.path.join(ROOT_DIR, "testing_videos")
+
+# Physics Config
+IMG_SIZE = 64        # Keep it small for speed
+BATCH_SIZE = 64      # Process more images at once
+EPOCHS = 3           # Number of training loops
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ==========================================
+# 2. THE DATA LOADER (Handling the 21 directories)
+# ==========================================
+class AvenueDataset(Dataset):
+    def __init__(self, root_dir, is_test=False):
+        self.is_test = is_test
+        # Find all jpg files inside subfolders (01, 02, etc.)
+        self.files = sorted(glob.glob(f"{root_dir}/**/*.jpg", recursive=True))
+        
+        if len(self.files) == 0:
+            print(f"WARNING: No images found in {root_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+        
+        # 1. Load & Resize
+        try:
+            img = cv2.imread(path)
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            img = img.astype(np.float32) / 255.0
+            # (H, W, C) -> (C, H, W)
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1)
+        except:
+            # Fallback for broken images
+            return torch.zeros(3, IMG_SIZE, IMG_SIZE)
+
+        if self.is_test:
+            # ID Parsing: "testing_videos/01/frame_001.jpg"
+            # We need to extract video_id=1 and frame_id=1
+            parts = path.split(os.sep)
+            try:
+                # Folder name is usually the video ID (e.g., '01')
+                vid_id = int(parts[-2]) 
+                # Filename is 'frame_xxxx.jpg' or similar
+                frame_part = parts[-1].split('.')[0] # remove .jpg
+                # Extract number from filename (e.g., "frame_0012" -> 12)
+                # We filter out non-digit characters to be safe
+                frame_num = int(''.join(filter(str.isdigit, frame_part)))
+                
+                full_id = f"{vid_id}_{frame_num}"
+            except:
+                full_id = f"unknown_{idx}"
+                
+            return img_tensor, full_id
+            
+        return img_tensor
+
+# ==========================================
+# 3. THE MODEL (The Anomaly Detector)
+# ==========================================
+class Autoencoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Compresses Reality
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.ReLU()
+        )
+        # Reconstructs Reality
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, 3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+# ==========================================
+# 4. EXECUTION
+# ==========================================
+def main():
+    print("--- PHASE 1: INITIALIZATION ---")
+    model = Autoencoder().to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+    
+    # Load Training Data
+    print(f"Loading Normal Data from {TRAIN_PATH}...")
+    train_ds = AvenueDataset(TRAIN_PATH, is_test=False)
+    # If dataset is empty, stop
+    if len(train_ds) == 0: return
+    
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+    print("--- PHASE 2: TRAINING (Learning Physics) ---")
+    model.train()
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        for imgs in train_loader:
+            imgs = imgs.to(DEVICE)
+            
+            recon = model(imgs)
+            loss = criterion(recon, imgs)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        print(f"Epoch {epoch+1}/{EPOCHS} - Reconstruction Error: {total_loss/len(train_loader):.5f}")
+
+    print("--- PHASE 3: TESTING (Hunting Ghosts) ---")
+    test_ds = AvenueDataset(TEST_PATH, is_test=True)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2)
+    
+    submission = []
+    model.eval()
+    
+    with torch.no_grad():
+        for img, img_id in test_loader:
+            img = img.to(DEVICE)
+            recon = model(img)
+            
+            # Anomaly Score = Error (Input - Output)
+            # We check the error across the whole image
+            error = torch.mean((img - recon)**2).item()
+            
+            submission.append([img_id[0], error])
+
+    # Save to CSV
+    df = pd.DataFrame(submission, columns=['Id', 'Predicted'])
+    
+    # Sort for tidiness (optional but good)
+    # The ID is string "1_10", so we need trickery to sort correctly if needed
+    # But usually Kaggle accepts any order as long as ID is correct
+    
+    # Normalize 0-1
+    df['Predicted'] = (df['Predicted'] - df['Predicted'].min()) / (df['Predicted'].max() - df['Predicted'].min())
+    
+    df.to_csv("submission.csv", index=False)
+    print("SUCCESS! submission.csv created.")
+
+if __name__ == "__main__":
+    main()
