@@ -98,7 +98,7 @@ Ensembling: Combining "Black Box" deep learning models with interpretable statis
 Data Handling: Efficient data loading and handling of corrupt/missing frames is crucial for real-world datasets.
 
 👤 Author
-Snehil Rajyash
+Snehil Raj
 
 Institution: IIT Roorkee
 
